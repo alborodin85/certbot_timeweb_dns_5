@@ -6,3 +6,4 @@ certbot/state/
 certbot/timeweb-certbot.log
 TODO.md
 requests
+certbot/test-runs.sh

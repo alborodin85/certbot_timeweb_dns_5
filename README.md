@@ -58,7 +58,7 @@ chmod +x certbot/timeweb-certbot.sh
 
 ## Первый выпуск сертификата
 
-Для домена второго уровня:
+Тестовый запуск для домена второго уровня:
 
 ```bash
 certbot certonly \
@@ -68,12 +68,13 @@ certbot certonly \
   --manual-cleanup-hook "/root/cerbot/certbot/timeweb-certbot.sh cleanup" \
   --deploy-hook "/root/cerbot/certbot/timeweb-certbot.sh deploy" \
   --agree-tos \
+  --dry-run \
   --email admin@example.com \
   -d example.com \
   -d '*.example.com'
 ```
 
-Для глубокого поддомена:
+Боевой выпуск для глубокого поддомена:
 
 ```bash
 certbot certonly \
