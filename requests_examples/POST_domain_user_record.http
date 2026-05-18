@@ -10,6 +10,7 @@ Content-Type: application/json
         "subdomain": "*",
         "value": "api_test"
     },
+    "ttl": {{ttl}},
     "type": "TXT"
 }
 
@@ -26,5 +27,6 @@ Content-Type: application/json
         "subdomain": null,
         "value": "api_test"
     },
+    "ttl": {{ttl}},
     "type": "TXT"
 }
