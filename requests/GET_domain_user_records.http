@@ -1,0 +1,5 @@
+### Получение ресурсных записей домена Timeweb
+GET https://api.timeweb.ru/v1.2/accounts/{{login}}/domains/{{domain}}/user-records?limit=100
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}

@@ -1,0 +1,5 @@
+### Информация о базах данных MySQL Timeweb
+GET https://api.timeweb.ru/v1.2/databases/{{login}}/mysql/
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}

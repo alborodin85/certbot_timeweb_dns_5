@@ -1,0 +1,30 @@
+### Добавление TXT-записи api_test для поддомена *.example.com Timeweb
+POST https://api.timeweb.ru/v1.2/accounts/{{login}}/domains/{{domain}}/user-records/
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "data": {
+        "subdomain": "*",
+        "value": "api_test"
+    },
+    "type": "TXT"
+}
+
+
+### Добавление TXT-записи api_test для самого домена example.com Timeweb
+POST https://api.timeweb.ru/v1.2/accounts/{{login}}/domains/{{domain}}/user-records/
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "data": {
+        "subdomain": null,
+        "value": "api_test"
+    },
+    "type": "TXT"
+}

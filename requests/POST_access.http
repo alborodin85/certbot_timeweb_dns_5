@@ -1,0 +1,5 @@
+### Получение токена доступа Timeweb
+POST https://api.timeweb.ru/v1.2/access
+accept: application/json
+x-app-key: {{appkey}}
+Authorization: Basic {{login}} {{password}}

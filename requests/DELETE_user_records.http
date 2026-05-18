@@ -1,0 +1,57 @@
+### Найти TXT-записи api_test и сохранить их ID
+GET https://api.timeweb.ru/v1.2/accounts/{{login}}/domains/{{domain}}/user-records?limit=100
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}
+
+> {%
+    if (!Array.isArray(response.body)) {
+        throw new Error("Ответ API не является массивом записей");
+    }
+
+    const records = response.body;
+
+    const rootRecord = records.find(record => {
+        const data = record["data"] || {};
+
+        return record["type"] === "TXT" &&
+            data["value"] === "api_test" &&
+            data["subdomain"] === null;
+    });
+
+    const wildcardRecord = records.find(record => {
+        const data = record["data"] || {};
+
+        return record["type"] === "TXT" &&
+            data["value"] === "api_test" &&
+            data["subdomain"] === "*";
+    });
+
+    if (!rootRecord) {
+        throw new Error("Не найдена TXT-запись api_test для корня домена");
+    }
+
+    if (!wildcardRecord) {
+        throw new Error("Не найдена TXT-запись api_test для wildcard-поддомена");
+    }
+
+    client.global.set("idrecords_api_test_root", String(rootRecord["id"]));
+    client.global.set("idrecords_api_test_wildcard", String(wildcardRecord["id"]));
+
+    client.log("ID TXT api_test для корня домена: " + rootRecord["id"]);
+    client.log("ID TXT api_test для wildcard: " + wildcardRecord["id"]);
+%}
+
+
+### Удаление TXT-записи api_test для самого домена
+DELETE https://api.timeweb.ru/v1.2/accounts/{{login}}/domains/{{domain}}/user-records/{{idrecords_api_test_root}}/
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}
+
+
+### Удаление TXT-записи api_test для поддомена *.{{domain}}
+DELETE https://api.timeweb.ru/v1.2/accounts/{{login}}/domains/{{domain}}/user-records/{{idrecords_api_test_wildcard}}/
+accept: */*
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}

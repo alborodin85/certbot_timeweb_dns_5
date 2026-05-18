@@ -1,0 +1,5 @@
+### Информация о сайтах на аккаунте Timeweb
+GET https://api.timeweb.ru/v1.1/sites/{{login}}
+accept: application/json
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}

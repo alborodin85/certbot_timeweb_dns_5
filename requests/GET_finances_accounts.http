@@ -1,0 +1,5 @@
+### Сведения о финансах и оплате Timeweb
+GET https://api.timeweb.ru/v1.1/finances/accounts/{{login}}
+accept: application/json
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}

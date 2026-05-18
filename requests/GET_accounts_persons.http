@@ -1,0 +1,5 @@
+### Получение ID персоны администратора домена Timeweb
+GET https://api.timeweb.ru/v3/accounts/{{login}}/persons
+accept: application/json
+x-app-key: {{appkey}}
+Authorization: Bearer {{token}}
