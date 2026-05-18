@@ -1,63 +1,148 @@
 # Certbot + Timeweb DNS-01 manual hook
 
-Скрипт предназначен для получения и автоматического продления wildcard-сертификатов Certbot + Let's Encrypt через API
-DNS Timeweb.
-Доступ к API DNS Timeweb осуществляется по запросу в службу поддержки, которая выдаст application token, который
-через специальную API позволяет получить уже рабочий auth token.
-Выдача application token осуществляется после отправки копии паспорта и проведения процедуры идентификации.
-Справка по API Timeweb: https://timeweb.com/ru/docs/publichnyj-api-timeweb/metody-api-dlya-virtualnogo-hostinga/.
-Используются --manual-auth-hook и --manual-cleanup-hook.
-Скрипту передаются парой два домена - со звездочкой и без звездочки.
-У доменов должны совпадать основные части, т. е. можно передать -d *.example.com и example.com и только парой.
-Если условие не соблюдено - то будет ошибка.
-Механизм добавляет через АПИ Timeweb необходимые записи, дожидается, когда записи появятся на DNS в США, ждет
-дополнительную паузу и проводит получение сертификата.
-Запускается вручную один раз; все дальнейшие обновления проводятся Certbot по расписанию.
-Исходные данные содержатся в файле timeweb.env, который после скачивания репозитория необходимо получить копированием
-из timeweb.env.example и помещением его рядом с timeweb-certbot.sh.
-Затем этот файл необходимо заполнить актуальными данными.
-Скрипт поддерживает все параметры, которые можно передавать в Certbot.
-Скрипты необходимо поместить в постоянное место (например /root/certbot), запускать от администратора и не менять это
-место в процессе работы, иначе автоматическое обновление работать не будет.
-После получения токена, скрипт удаляет созданные им TXT DNS записи в независомости от успешности или неуспешности операции.
-Имеется следующая отладочная информация:
+Скрипт `timeweb-certbot.sh` получает и продлевает wildcard-сертификаты Let's Encrypt через Certbot и DNS-01 challenge в DNS Timeweb.
+Эксплуатационная директория на сервере: `/root/cerbot`. Все команды ниже приведены относительно нее, хотя править файлы можно в текущей рабочей копии проекта.
 
-- Собственные логи Certbot, куда он пишет всю свою актвиность
-- Подробный вывод нашего скрипта в stdout
-- Краткий лог файл, который находится в .... и в котором фиксируются успешные выпуски продления сертификатов и ошибки
-  при получении сертификатов.
-  Сами попытки получения сертификата, когда он еще не истек, в этом логе не фиксируются.
-  Лог автоматически ротируется при достижении размера 1МБ - при этом перед дописыванием новой записи, удаляется самая
-  старая запись.
-  Каждая запись в этом логе представляет собой одну строку, в которой все переносы строк и табы заменены пробелами и
-  несколько подряд идущих пробелов объедены в один пробел.
+Скрипт использует API виртуального хостинга Timeweb:
+https://timeweb.com/ru/docs/publichnyj-api-timeweb/metody-api-dlya-virtualnogo-hostinga/.
+Для доступа нужны логин Timeweb, пароль и `application token` (`TIMEWEB_APPKEY`). Доступ к DNS API и application token выдаются поддержкой Timeweb после идентификации.
 
+## Что делает скрипт
 
-Скопировать `timeweb.env.example` в `timeweb.env` и заполнить своими данными
+- запускает `certbot certonly --manual --preferred-challenges dns`;
+- передает Certbot'у `--manual-auth-hook` и `--manual-cleanup-hook`;
+- получает временный auth token Timeweb через `/v1.2/access`;
+- определяет DNS-зону Timeweb для переданного домена;
+- создает TXT-запись `_acme-challenge...` с `CERTBOT_VALIDATION`;
+- ждет, пока TXT появится у всех настроенных DNS-резолверов;
+- после проверки Certbot удаляет созданную TXT-запись через cleanup hook.
+
+Certbot сохраняет пути к manual hook'ам в renewal-конфигурации. Поэтому после первого успешного выпуска нельзя переносить скрипт в другое место без переоформления или правки renewal-конфига.
+
+## Ограничения по доменам
+
+За один запуск нужно передать ровно два домена:
+
+- обычный домен;
+- wildcard для того же домена.
+
+Примеры допустимых пар:
+
+```bash
+-d example.com -d '*.example.com'
+-d app.example.com -d '*.app.example.com'
+```
+
+Недопустимо передавать только wildcard, больше двух доменов или несовпадающую пару вроде `example.com` и `*.app.example.com`.
+
+Wildcard нужно брать в кавычки. Без кавычек shell может раскрыть `*` как файловую маску до запуска скрипта.
+
+## Подготовка сервера
 
 ```bash
 apt update
 apt install -y certbot curl jq dnsutils
+cd /root/cerbot
+cp certbot/timeweb.env.example certbot/timeweb.env
+chmod 600 certbot/timeweb.env
+chmod +x certbot/timeweb-certbot.sh
 ```
 
-```bahs
-# Предполагается, что репозиторий извлечен в /root/certbot, и скрипт, соответственно, находится по пути /root/certbot/certbot/timeweb-certbot.sh
-[пример запроса]
+Заполнить `certbot/timeweb.env`:
+
+```bash
+TIMEWEB_LOGIN="your_login"
+TIMEWEB_PASSWORD="your_timeweb_password"
+TIMEWEB_APPKEY="your_timeweb_app_key"
+```
+
+Опциональные настройки DNS-ожидания:
+
+```bash
+DNS_RESOLVERS="1.1.1.1 8.8.8.8"
+DNS_WAIT_TIMEOUT="300"
+DNS_WAIT_INTERVAL="10"
+DNS_EXTRA_SLEEP_AFTER_VISIBLE="60"
+```
+
+По умолчанию `timeweb.env` должен лежать рядом со скриптом. При необходимости путь можно переопределить переменной `TIMEWEB_ENV_FILE`, а каталог состояния - `TIMEWEB_STATE_DIR`.
+
+## Первый выпуск сертификата
+
+Для домена второго уровня:
+
+```bash
+/root/cerbot/certbot/timeweb-certbot.sh run \
+  --agree-tos \
+  --email admin@example.com \
+  -d example.com \
+  -d '*.example.com'
 ```
 
 Для глубокого поддомена:
 
 ```bash
-
-[пример запроса]
+/root/cerbot/certbot/timeweb-certbot.sh run \
+  --agree-tos \
+  --email admin@example.com \
+  -d app.example.com \
+  -d '*.app.example.com'
 ```
 
-## Важное
+Все параметры после `run` передаются в Certbot. Например, можно добавлять `--non-interactive`, `--staging`, `--dry-run`, `--expand` и другие опции Certbot.
 
-Wildcard лучше всегда брать в кавычки:
+После успешного выпуска файлы сертификата будут доступны в стандартном каталоге Let's Encrypt:
 
 ```bash
--d '*.example.com'   -- это актуально еще?
+/etc/letsencrypt/live/example.com/fullchain.pem
+/etc/letsencrypt/live/example.com/privkey.pem
 ```
 
-Без кавычек shell может попытаться раскрыть `*` как файловую маску.
+Для поддомена имя каталога обычно соответствует первому домену в сертификате, например `/etc/letsencrypt/live/app.example.com/`.
+
+## Продление
+
+Первый запуск выполняется вручную. Дальше Certbot продлевает сертификат штатным механизмом пакета `certbot` - через systemd timer или cron, в зависимости от системы.
+При продлении Certbot использует сохраненные hook-команды:
+
+```bash
+/root/cerbot/certbot/timeweb-certbot.sh auth
+/root/cerbot/certbot/timeweb-certbot.sh cleanup
+```
+
+Проверить renewal-конфигурацию можно так:
+
+```bash
+certbot certificates
+certbot renew --dry-run
+```
+
+## Состояние и очистка TXT
+
+Скрипт хранит созданные TXT-записи в файле:
+
+```bash
+/root/cerbot/certbot/state/records.tsv
+```
+
+Файл нужен cleanup hook'у, чтобы удалить именно те записи, которые создал текущий запуск. Права на каталог `state` и файл состояния скрипт выставляет автоматически.
+
+Если процесс был прерван до cleanup hook'а, TXT-запись может остаться в DNS Timeweb. В этом случае ее нужно удалить вручную в панели Timeweb или через API, а затем проверить `state/records.tsv`.
+
+## Логи и диагностика
+
+Основные источники диагностики:
+
+- stderr/stdout запуска `timeweb-certbot.sh`;
+- стандартные логи Certbot в `/var/log/letsencrypt/`;
+- renewal-конфиги в `/etc/letsencrypt/renewal/`.
+
+В текущей версии скрипта отдельный собственный лог-файл не ведется: сообщения выводятся в консоль и попадают в логи того механизма, который запускает Certbot.
+
+Типовые проверки:
+
+```bash
+dig +short @1.1.1.1 TXT _acme-challenge.example.com
+dig +short @8.8.8.8 TXT _acme-challenge.example.com
+certbot renew --dry-run
+```
