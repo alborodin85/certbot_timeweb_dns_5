@@ -24,7 +24,7 @@ SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Конфигурация всегда лежит рядом со скриптом. Это намеренное ограничение:
-# renewal-конфиг Certbot должен ссылаться на стабильное место в /root/cerbot.
+# renewal-конфиг Certbot должен ссылаться на стабильное место в /root/certbot.
 ENV_FILE="$SCRIPT_DIR/timeweb.env"
 
 # STATE_FILE хранит созданные TXT-записи: id, DNS-зону, subdomain и value.
@@ -37,14 +37,57 @@ STATE_FILE="$STATE_DIR/records.tsv"
 RUN_DIR="$STATE_DIR/runs"
 
 # Краткий собственный лог: только успешные deploy и ошибки скрипта.
-LOG_FILE="$SCRIPT_DIR/timeweb-certbot.log"
-LOG_MAX_BYTES=1048576
+# Путь задаем относительно самого sh-файла, чтобы он не зависел от cwd.
+TIMEWEB_SUMMARY_LOG_FILE="$SCRIPT_DIR/timeweb-certbot-summary.log"
+TIMEWEB_SUMMARY_LOG_MAX_BYTES=1048576
 
 # Минимальный TTL DNS-записи, который принимает Timeweb API.
 DNS_RECORD_TTL=300
 
+# Общие параметры curl для запросов к Timeweb API.
+#
+# Иногда первый запрос на сервере падает с временной ошибкой DNS вида
+# "Could not resolve host: api.timeweb.ru". `nslookup` при этом может работать,
+# потому что это отдельный процесс и отдельная попытка обращения к резолверу.
+# Поэтому даем curl несколько повторных попыток.
+CURL_OPTS=(
+  -sS
+  --connect-timeout 10
+  --retry 5
+  --retry-delay 2
+  --retry-max-time 120
+)
+
+# В новых версиях curl есть --retry-all-errors. Он заставляет retry срабатывать
+# в том числе на DNS-resolution ошибки. Проверяем поддержку опции динамически,
+# чтобы старый curl не упал из-за неизвестного параметра.
+if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+  CURL_OPTS+=(--retry-all-errors)
+fi
+
 # Базовый URL старого публичного API Timeweb для виртуального хостинга.
 API_BASE="https://api.timeweb.ru"
+
+RUN_STARTED_AT="$(date +%s)"
+
+elapsed_since() {
+  local started_at="$1"
+  printf '%s' "$(( $(date +%s) - started_at ))"
+}
+
+format_duration() {
+  local seconds="$1"
+  local minutes remainder
+
+  minutes=$(( seconds / 60 ))
+  remainder=$(( seconds % 60 ))
+
+  if (( minutes > 0 )); then
+    printf '%d мин %d сек' "$minutes" "$remainder"
+  else
+    printf '%d сек' "$seconds"
+  fi
+}
 
 # Обычный подробный вывод. Пишем в stderr, чтобы stdout можно было использовать
 # для возвращаемых значений функций, например token или id записи.
@@ -54,25 +97,25 @@ log() {
 
 rotate_event_log() {
   # Если лога еще нет, ротация не нужна.
-  [[ -f "$LOG_FILE" ]] || return 0
+  [[ -f "$TIMEWEB_SUMMARY_LOG_FILE" ]] || return 0
 
   local size tmp
   # wc -c возвращает размер файла в байтах. Если по любой причине прочитать
   # размер не удалось, не мешаем основному сценарию работы Certbot.
-  size="$(wc -c < "$LOG_FILE" 2>/dev/null)" || return 0
+  size="$(wc -c < "$TIMEWEB_SUMMARY_LOG_FILE" 2>/dev/null)" || return 0
   [[ "$size" =~ ^[0-9]+$ ]] || return 0
 
   # Если лог достиг лимита, за один вызов удаляем только одну самую старую
   # строку. Даже если файл пока останется больше 1 МБ, следующие записи
   # постепенно вытеснят старые длинные строки.
-  (( size < LOG_MAX_BYTES )) && return 0
+  (( size < TIMEWEB_SUMMARY_LOG_MAX_BYTES )) && return 0
 
   tmp="$(mktemp)" || return 0
-  tail -n +2 "$LOG_FILE" > "$tmp" 2>/dev/null || {
+  tail -n +2 "$TIMEWEB_SUMMARY_LOG_FILE" > "$tmp" 2>/dev/null || {
     rm -f "$tmp"
     return 0
   }
-  mv "$tmp" "$LOG_FILE" 2>/dev/null || {
+  mv "$tmp" "$TIMEWEB_SUMMARY_LOG_FILE" 2>/dev/null || {
     rm -f "$tmp"
     return 0
   }
@@ -91,17 +134,20 @@ event_log() {
 
   # Логирование не должно ломать выпуск сертификата. Поэтому все операции
   # с логом заканчиваются `|| return 0` или `|| true`.
-  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || return 0
-  touch "$LOG_FILE" 2>/dev/null || return 0
-  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  mkdir -p "$(dirname "$TIMEWEB_SUMMARY_LOG_FILE")" 2>/dev/null || return 0
+  touch "$TIMEWEB_SUMMARY_LOG_FILE" 2>/dev/null || return 0
+  chmod 600 "$TIMEWEB_SUMMARY_LOG_FILE" 2>/dev/null || true
   rotate_event_log 2>/dev/null || true
-  printf '%s %s %s\n' "$ts" "$level" "$normalized" >> "$LOG_FILE" 2>/dev/null || true
+  printf '%s %s %s\n' "$ts" "$level" "$normalized" >> "$TIMEWEB_SUMMARY_LOG_FILE" 2>/dev/null || true
 }
 
 fail() {
   # Единая точка аварийного завершения: сообщение видно в stderr и в summary-логе.
+  local elapsed
+  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
   printf '[timeweb-certbot] ERROR: %s\n' "$*" >&2
-  event_log "ERROR" "$*"
+  printf '[timeweb-certbot] Завершено с ошибкой за %s\n' "$(format_duration "$elapsed")" >&2
+  event_log "ERROR" "$*; duration=${elapsed}s"
   exit 1
 }
 
@@ -112,7 +158,9 @@ on_error() {
   local exit_code="$1"
   local line="$2"
   local command="$3"
-  event_log "ERROR" "Необработанная ошибка: команда '$command' завершилась с кодом $exit_code на строке $line"
+  local elapsed
+  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
+  event_log "ERROR" "Необработанная ошибка: команда '$command' завершилась с кодом $exit_code на строке $line; duration=${elapsed}s"
 }
 
 # При любой необработанной ошибке bash подставит код возврата, номер строки
@@ -177,7 +225,7 @@ get_token() {
   #   1. application key передается в x-app-key;
   #   2. логин/пароль передаются через HTTP Basic Auth;
   #   3. в ответе приходит временный Bearer token для остальных запросов.
-  body="$(curl -sS -X POST "$API_BASE/v1.2/access" \
+  body="$(curl "${CURL_OPTS[@]}" -X POST "$API_BASE/v1.2/access" \
     -H "accept: application/json" \
     -H "x-app-key: $TIMEWEB_APPKEY" \
     -u "$TIMEWEB_LOGIN:$TIMEWEB_PASSWORD")"
@@ -196,7 +244,7 @@ api_get_status() {
 
   # Для проверки существования зоны нам нужен HTTP-код. Тело ответа пишем
   # во временный файл, а код печатаем в stdout через -w '%{http_code}'.
-  curl -sS -o /tmp/timeweb-api-body.$$ -w '%{http_code}' \
+  curl "${CURL_OPTS[@]}" -o /tmp/timeweb-api-body.$$ -w '%{http_code}' \
     -H 'accept: */*' \
     -H "x-app-key: $TIMEWEB_APPKEY" \
     -H "Authorization: Bearer $token" \
@@ -298,7 +346,7 @@ create_txt_record() {
 
   # -D сохраняет response headers, -o сохраняет body, -w печатает HTTP-код.
   # Location header часто содержит id созданной DNS-записи.
-  code="$(curl -sS -D "$headers" -o "$body" -w '%{http_code}' -X POST "$url" \
+  code="$(curl "${CURL_OPTS[@]}" -D "$headers" -o "$body" -w '%{http_code}' -X POST "$url" \
     -H 'accept: */*' \
     -H "x-app-key: $TIMEWEB_APPKEY" \
     -H "Authorization: Bearer $token" \
@@ -347,7 +395,7 @@ find_record_id() {
   # Запрашиваем записи зоны и выбираем TXT с тем же subdomain и value.
   # tail -n1 берет последнюю подходящую запись, если вдруг API вернул несколько.
   url="$API_BASE/v1.2/accounts/$(urlenc "$TIMEWEB_LOGIN")/domains/$(urlenc "$zone")/user-records?limit=100"
-  records="$(curl -sS "$url" \
+  records="$(curl "${CURL_OPTS[@]}" "$url" \
     -H 'accept: */*' \
     -H "x-app-key: $TIMEWEB_APPKEY" \
     -H "Authorization: Bearer $token")"
@@ -379,7 +427,7 @@ delete_record() {
   # состояние DNS достигнуто.
   body="$(mktemp)"
   url="$API_BASE/v1.2/accounts/$(urlenc "$TIMEWEB_LOGIN")/domains/$(urlenc "$zone")/user-records/$id/"
-  code="$(curl -sS -o "$body" -w '%{http_code}' -X DELETE "$url" \
+  code="$(curl "${CURL_OPTS[@]}" -o "$body" -w '%{http_code}' -X DELETE "$url" \
     -H 'accept: */*' \
     -H "x-app-key: $TIMEWEB_APPKEY" \
     -H "Authorization: Bearer $token")" || true
@@ -448,7 +496,9 @@ wait_dns_visible() {
 
   # deadline - абсолютное время окончания ожидания. Так проще считать таймаут,
   # чем накапливать количество попыток.
-  local deadline=$(( $(date +%s) + DNS_WAIT_TIMEOUT ))
+  local start deadline elapsed
+  start="$(date +%s)"
+  deadline=$(( start + DNS_WAIT_TIMEOUT ))
   local resolver out ok
 
   log "Жду TXT $fqdn = $value через резолверы: $DNS_RESOLVERS"
@@ -474,11 +524,14 @@ wait_dns_visible() {
       # Даже когда DNS уже виден у наших резолверов, Let's Encrypt может
       # проверить чуть позже или через другой путь кешей, поэтому держим
       # дополнительную паузу.
-      log "TXT уже виден через все резолверы. Жду еще ${DNS_EXTRA_SLEEP_AFTER_VISIBLE} сек."
+      elapsed=$(( $(date +%s) - start ))
+      log "TXT уже виден через все резолверы через $(format_duration "$elapsed"). Жду еще ${DNS_EXTRA_SLEEP_AFTER_VISIBLE} сек."
       sleep "$DNS_EXTRA_SLEEP_AFTER_VISIBLE"
       return 0
     fi
 
+    elapsed=$(( $(date +%s) - start ))
+    log "Записи DNS пока не появились через все резолверы. Прошло ${elapsed} сек. из ${DNS_WAIT_TIMEOUT} сек.; следующая проверка через ${DNS_WAIT_INTERVAL} сек."
     sleep "$DNS_WAIT_INTERVAL"
   done
 
@@ -504,6 +557,10 @@ validate_certbot_domain_pair() {
   #   example.com + *.example.com
   # Это упрощает state, cleanup и ожидание DNS. Ошибку показываем в auth hook,
   # потому что именно там Certbot передает CERTBOT_ALL_DOMAINS.
+  #
+  # Важно: для wildcard-имени Certbot передает в hook уже нормализованный
+  # домен без "*.". Поэтому команда с `-d it5.su -d '*.it5.su'` в hook может
+  # выглядеть как `it5.su it5.su`. Это нормально.
   [[ -n "${CERTBOT_ALL_DOMAINS:-}" ]] || fail "Certbot не передал CERTBOT_ALL_DOMAINS; невозможно проверить пару обычный домен + wildcard"
 
   local domains=()
@@ -515,26 +572,16 @@ validate_certbot_domain_pair() {
 
   local a="${domains[0]%.}"
   local b="${domains[1]%.}"
-  local plain wildcard
+  local normalized_a normalized_b
 
-  # Принимаем любой порядок - обычный домен первым или wildcard первым.
-  if [[ "$a" == \*.* && "$b" != \*.* ]]; then
-    wildcard="$a"
-    plain="$b"
-  elif [[ "$b" == \*.* && "$a" != \*.* ]]; then
-    wildcard="$b"
-    plain="$a"
-  else
-    fail "Пара доменов должна быть вида example.com и *.example.com. Сейчас: $a, $b"
+  normalized_a="$(normalize_domain "$a")"
+  normalized_b="$(normalize_domain "$b")"
+
+  if [[ "$normalized_a" != "$normalized_b" ]]; then
+    fail "Обычный домен и wildcard должны относиться к одному имени. Certbot передал: $a, $b"
   fi
 
-  # ${wildcard#*.} удаляет минимальный префикс до первой точки, то есть
-  # превращает *.example.com в example.com.
-  if [[ "${wildcard#*.}" != "$plain" ]]; then
-    fail "Wildcard и обычный домен не совпадают: $plain и $wildcard"
-  fi
-
-  log "Пара доменов проверена: $plain + $wildcard"
+  log "Пара доменов проверена: ${domains[0]} + ${domains[1]} -> $normalized_a"
 }
 
 process_is_certbot() {
@@ -630,6 +677,7 @@ cmd_auth() {
   require_hook_cmds
 
   local identifier validation domain token zone subdomain fqdn id
+  local elapsed
 
   # В разных версиях/режимах Certbot имя домена может быть в CERTBOT_IDENTIFIER
   # или CERTBOT_DOMAIN. Берем первый доступный вариант.
@@ -656,6 +704,8 @@ cmd_auth() {
   log "Создана TXT-запись id=$id"
 
   wait_dns_visible "$fqdn" "$validation"
+  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
+  log "Auth hook завершен за $(format_duration "$elapsed")"
 }
 
 cmd_cleanup() {
@@ -667,6 +717,7 @@ cmd_cleanup() {
   require_hook_cmds
 
   local validation token tmp id zone subdomain value found=0 failed=0
+  local elapsed
   validation="${CERTBOT_VALIDATION:-}"
   [[ -n "$validation" ]] || fail "Certbot не передал CERTBOT_VALIDATION"
   token="$(get_token)"
@@ -700,6 +751,9 @@ cmd_cleanup() {
   if (( failed > 0 )); then
     event_log "ERROR" "Cleanup hook не смог удалить TXT-записи для текущего CERTBOT_VALIDATION: failed=$failed"
   fi
+
+  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
+  log "Cleanup hook завершен за $(format_duration "$elapsed")"
 }
 
 cmd_deploy() {
@@ -709,9 +763,11 @@ cmd_deploy() {
   # сертификата. Это правильное место для краткого лога "сертификат обновлен".
   local renewed_lineage="${RENEWED_LINEAGE:-unknown}"
   local renewed_domains="${RENEWED_DOMAINS:-unknown}"
+  local elapsed
+  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
 
-  log "Сертификат успешно получен или продлен: domains=$renewed_domains, lineage=$renewed_lineage"
-  event_log "OK" "Сертификат успешно получен или продлен: domains=$renewed_domains lineage=$renewed_lineage"
+  log "Сертификат успешно получен или продлен за $(format_duration "$elapsed"): domains=$renewed_domains, lineage=$renewed_lineage"
+  event_log "OK" "Сертификат успешно получен или продлен: domains=$renewed_domains lineage=$renewed_lineage duration=${elapsed}s"
 }
 
 case "${1:-}" in
