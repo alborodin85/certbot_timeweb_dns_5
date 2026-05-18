@@ -46,8 +46,9 @@ TIMEWEB_SUMMARY_LOG_MAX_BYTES=1048576
 # Минимальный TTL DNS-записи, который принимает Timeweb API.
 DNS_RECORD_TTL=300
 
-# Наш сценарий всегда выпускает сертификат на пару обычный домен + wildcard.
-# Для Certbot это два DNS-01 challenge и, соответственно, две TXT-записи.
+# Наш основной сценарий: обычный домен + wildcard. Чаще всего это приводит
+# к двум DNS-01 challenge, но в реальном выпуске CA иногда дает только один
+# auth hook. Поэтому это число используем только для человекочитаемых логов.
 EXPECTED_DNS_CHALLENGES=2
 
 # Общие параметры curl для запросов к Timeweb API.
@@ -606,9 +607,10 @@ split_domain_list() {
 }
 
 validate_certbot_domain_pair() {
-  # Наш сценарий сознательно ограничен парой:
-  #   example.com + *.example.com
-  # Это упрощает state, cleanup и ожидание DNS. Ошибку показываем в auth hook,
+  # Поддерживаем два сценария:
+  #   1. один домен: example.com или *.example.com;
+  #   2. пара обычный домен + wildcard для него.
+  # Больше двух доменов считаем ошибкой. Проверку делаем в auth hook,
   # потому что именно там Certbot передает CERTBOT_ALL_DOMAINS.
   #
   # Важно: для wildcard-имени Certbot передает в hook уже нормализованный
@@ -619,8 +621,13 @@ validate_certbot_domain_pair() {
   local domains=()
   split_domain_list domains "$CERTBOT_ALL_DOMAINS"
 
+  if ((${#domains[@]} == 1)); then
+    log "Проверка списка доменов пройдена: передан один домен (${domains[0]})."
+    return 0
+  fi
+
   if ((${#domains[@]} != 2)); then
-    fail "Нужно указать ровно два домена: обычный и wildcard. Certbot передал: ${#domains[@]} (${domains[*]:-нет})"
+    fail "Нужно указать один домен или пару обычный домен + wildcard. Certbot передал: ${#domains[@]} (${domains[*]:-нет})"
   fi
 
   local a="${domains[0]%.}"
@@ -635,6 +642,16 @@ validate_certbot_domain_pair() {
   fi
 
   log "Пара доменов проверена: ${domains[0]} + ${domains[1]} -> $normalized_a"
+}
+
+remaining_challenges_count() {
+  local remaining="${CERTBOT_REMAINING_CHALLENGES:-}"
+
+  if [[ "$remaining" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$remaining"
+  else
+    printf '%s' "-1"
+  fi
 }
 
 process_is_certbot() {
@@ -772,14 +789,14 @@ cmd_auth() {
   #
   # Certbot вызывает его до проверки домена Let's Encrypt. В этот момент
   # Certbot уже знает validation token и передает его через CERTBOT_VALIDATION.
-  # Задача hook'а: создать TXT-запись. В нашем сценарии Certbot вызывает auth
-  # дважды подряд для обычного домена и wildcard. Первый hook только создает
-  # первую TXT-запись, второй создает вторую и ждет появления обеих записей.
+  # Задача hook'а: создать TXT-запись. Если Certbot вызывает auth несколько
+  # раз подряд, ждать начинаем только на последнем вызове, когда больше нет
+  # оставшихся challenge в текущем наборе.
   load_env
   require_hook_cmds
 
   local identifier validation domain token zone subdomain fqdn id records_snapshot
-  local elapsed pair_started_at run_values=()
+  local elapsed pair_started_at remaining_challenges run_values=()
 
   # В разных версиях/режимах Certbot имя домена может быть в CERTBOT_IDENTIFIER
   # или CERTBOT_DOMAIN. Берем первый доступный вариант.
@@ -809,9 +826,11 @@ cmd_auth() {
   log "TXT-записи Timeweb для zone=$zone, subdomain=$subdomain: $records_snapshot"
   event_log "INFO" "Создана TXT-запись: id=$id zone=$zone subdomain=$subdomain fqdn=$fqdn value=$validation ttl=${DNS_RECORD_TTL}s; current_txt=$records_snapshot"
 
+  remaining_challenges="$(remaining_challenges_count)"
   mapfile -t run_values < <(load_run_values "$zone" "$subdomain")
-  if ((${#run_values[@]} < EXPECTED_DNS_CHALLENGES)); then
-    log "Создано TXT-записей текущего запуска: ${#run_values[@]}/${EXPECTED_DNS_CHALLENGES}. DNS-ожидание начнется после второй записи."
+
+  if (( remaining_challenges > 0 )); then
+    log "Создано TXT-записей текущего запуска: ${#run_values[@]}. До ожидания DNS осталось challenge: $remaining_challenges."
     return 0
   fi
 
@@ -822,8 +841,8 @@ cmd_auth() {
   wait_dns_values_visible "$fqdn" "${run_values[@]}"
   pair_started_at="$(certbot_elapsed_start)"
   elapsed="$(elapsed_since "$pair_started_at")"
-  log "DNS-подготовка для двух доменов завершена за $(format_duration "$elapsed"): создано ${#run_values[@]}/${EXPECTED_DNS_CHALLENGES} TXT, DNS виден, дополнительная пауза выдержана."
-  event_log "INFO" "DNS-подготовка для двух доменов завершена: fqdn=$fqdn records=${#run_values[@]}/${EXPECTED_DNS_CHALLENGES} duration=${elapsed}s"
+  log "DNS-подготовка завершена за $(format_duration "$elapsed"): создано TXT=${#run_values[@]}, DNS виден, дополнительная пауза выдержана."
+  event_log "INFO" "DNS-подготовка завершена: fqdn=$fqdn records=${#run_values[@]} duration=${elapsed}s"
 }
 
 cmd_cleanup() {
