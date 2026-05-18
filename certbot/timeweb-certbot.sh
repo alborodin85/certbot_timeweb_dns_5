@@ -31,6 +31,7 @@ ENV_FILE="$SCRIPT_DIR/timeweb.env"
 # Это нужно cleanup hook'у, чтобы удалить ровно те записи, которые создал скрипт.
 STATE_DIR="$SCRIPT_DIR/state"
 STATE_FILE="$STATE_DIR/records.tsv"
+CERTBOT_RUN_STARTED_FILE="$STATE_DIR/certbot-run-started-at"
 
 # RUN_DIR хранит маркеры активных запусков Certbot. Они помогают понять,
 # что второй auth hook в том же запуске не должен чистить запись первого hook'а.
@@ -73,6 +74,19 @@ RUN_STARTED_AT="$(date +%s)"
 elapsed_since() {
   local started_at="$1"
   printf '%s' "$(( $(date +%s) - started_at ))"
+}
+
+certbot_elapsed_start() {
+  if [[ -f "$CERTBOT_RUN_STARTED_FILE" ]]; then
+    local started_at
+    read -r started_at < "$CERTBOT_RUN_STARTED_FILE" || started_at=""
+    if [[ "$started_at" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$started_at"
+      return 0
+    fi
+  fi
+
+  printf '%s' "$RUN_STARTED_AT"
 }
 
 format_duration() {
@@ -197,6 +211,7 @@ load_env() {
   chmod 700 "$STATE_DIR" || true
   chmod 700 "$RUN_DIR" || true
   chmod 600 "$STATE_FILE" || true
+  [[ ! -f "$CERTBOT_RUN_STARTED_FILE" ]] || chmod 600 "$CERTBOT_RUN_STARTED_FILE" || true
 }
 
 require_hook_cmds() {
@@ -404,6 +419,26 @@ find_record_id() {
     --arg subdomain "$subdomain" \
     --arg value "$value" \
     '.[] | select(.type == "TXT" and .data.subdomain == $subdomain and .data.value == $value) | .id' | tail -n1
+}
+
+summarize_txt_records() {
+  local zone="$1"
+  local subdomain="$2"
+  local token="$3"
+  local records url
+
+  url="$API_BASE/v1.2/accounts/$(urlenc "$TIMEWEB_LOGIN")/domains/$(urlenc "$zone")/user-records?limit=100"
+  records="$(curl "${CURL_OPTS[@]}" "$url" \
+    -H 'accept: */*' \
+    -H "x-app-key: $TIMEWEB_APPKEY" \
+    -H "Authorization: Bearer $token")" || {
+      printf '%s' '<api-read-failed>'
+      return 0
+    }
+
+  printf '%s' "$records" | jq -r \
+    --arg subdomain "$subdomain" \
+    '[.[] | select(.type == "TXT" and .data.subdomain == $subdomain) | "\(.id)=\(.data.value)"] | if length == 0 then "<none>" else join("; ") end' 2>/dev/null || printf '%s' '<parse-failed>'
 }
 
 save_state() {
@@ -663,6 +698,8 @@ prepare_domain_run() {
   # Сохраняем PID certbot и немного диагностической информации. Само наличие
   # marker-файла не важно; важен живой PID внутри него.
   pid="$(certbot_parent_pid)"
+  printf '%s\n' "$RUN_STARTED_AT" > "$CERTBOT_RUN_STARTED_FILE"
+  chmod 600 "$CERTBOT_RUN_STARTED_FILE" || true
   printf '%s\n%s\n%s\n' "$pid" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${CERTBOT_ALL_DOMAINS:-}" > "$marker"
   chmod 600 "$marker" || true
 }
@@ -676,7 +713,7 @@ cmd_auth() {
   load_env
   require_hook_cmds
 
-  local identifier validation domain token zone subdomain fqdn id
+  local identifier validation domain token zone subdomain fqdn id records_snapshot
   local elapsed
 
   # В разных версиях/режимах Certbot имя домена может быть в CERTBOT_IDENTIFIER
@@ -702,6 +739,9 @@ cmd_auth() {
   id="$(create_txt_record "$zone" "$subdomain" "$validation" "$token")"
   save_state "$id" "$zone" "$subdomain" "$validation"
   log "Создана TXT-запись id=$id"
+  records_snapshot="$(summarize_txt_records "$zone" "$subdomain" "$token")"
+  log "TXT-записи Timeweb для zone=$zone, subdomain=$subdomain: $records_snapshot"
+  event_log "INFO" "Создана TXT-запись: id=$id zone=$zone subdomain=$subdomain fqdn=$fqdn value=$validation ttl=${DNS_RECORD_TTL}s; current_txt=$records_snapshot"
 
   wait_dns_visible "$fqdn" "$validation"
   elapsed="$(elapsed_since "$RUN_STARTED_AT")"
@@ -763,11 +803,13 @@ cmd_deploy() {
   # сертификата. Это правильное место для краткого лога "сертификат обновлен".
   local renewed_lineage="${RENEWED_LINEAGE:-unknown}"
   local renewed_domains="${RENEWED_DOMAINS:-unknown}"
-  local elapsed
-  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
+  local started_at elapsed
+  started_at="$(certbot_elapsed_start)"
+  elapsed="$(elapsed_since "$started_at")"
 
   log "Сертификат успешно получен или продлен за $(format_duration "$elapsed"): domains=$renewed_domains, lineage=$renewed_lineage"
   event_log "OK" "Сертификат успешно получен или продлен: domains=$renewed_domains lineage=$renewed_lineage duration=${elapsed}s"
+  rm -f "$CERTBOT_RUN_STARTED_FILE"
 }
 
 case "${1:-}" in
