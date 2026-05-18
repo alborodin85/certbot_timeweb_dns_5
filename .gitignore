@@ -1,9 +1,11 @@
 .idea
+.agents
+.codex
 http-client.env.json
 timeweb.env
 state/
 certbot/state/
-certbot/timeweb-certbot.log
+certbot/timeweb-certbot-summary.log
 TODO.md
 requests
 certbot/test-runs.sh

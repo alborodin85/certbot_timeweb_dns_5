@@ -1,7 +1,7 @@
 # Certbot + Timeweb DNS-01 manual hook
 
 Скрипт `certbot/timeweb-certbot.sh` получает и продлевает wildcard-сертификаты Let's Encrypt через Certbot и DNS-01 challenge в DNS Timeweb.
-Эксплуатационная директория на сервере: `/root/cerbot`.
+Эксплуатационная директория на сервере: `/root/certbot`.
 
 Скрипт использует API виртуального хостинга Timeweb:
 https://timeweb.com/ru/docs/publichnyj-api-timeweb/metody-api-dlya-virtualnogo-hostinga/.
@@ -46,17 +46,20 @@ Wildcard нужно брать в кавычки. Без кавычек shell м
 ```bash
 apt update
 apt install -y certbot curl jq dnsutils procps
-git clone git@github.com:alborodin85/certbot_timeweb_dns_5.git /root/cerbot
-cd /root/cerbot
+git clone git@github.com:alborodin85/certbot_timeweb_dns_5.git /root/certbot
+cd /root/certbot
 cp certbot/timeweb.env.example certbot/timeweb.env
 chmod 600 certbot/timeweb.env
 chmod +x certbot/timeweb-certbot.sh
 ```
 
 Заполнить `certbot/timeweb.env` по комментариям внутри файла.
-Файл настроек должен лежать рядом со скриптом: `/root/cerbot/certbot/timeweb.env`.
+Файл настроек должен лежать рядом со скриптом: `/root/certbot/certbot/timeweb.env`.
 
 ## Первый выпуск сертификата
+
+В примерах ниже `example.com`, `*.example.com` и `admin@example.com` нужно заменить на реальный домен и email.
+Let's Encrypt не выпускает сертификаты для `example.com`, поэтому при запуске примера без замены Certbot остановится до вызова hook-скрипта.
 
 Тестовый запуск для домена второго уровня:
 
@@ -64,9 +67,9 @@ chmod +x certbot/timeweb-certbot.sh
 certbot certonly \
   --manual \
   --preferred-challenges dns \
-  --manual-auth-hook "/root/cerbot/certbot/timeweb-certbot.sh auth" \
-  --manual-cleanup-hook "/root/cerbot/certbot/timeweb-certbot.sh cleanup" \
-  --deploy-hook "/root/cerbot/certbot/timeweb-certbot.sh deploy" \
+  --manual-auth-hook "/root/certbot/certbot/timeweb-certbot.sh auth" \
+  --manual-cleanup-hook "/root/certbot/certbot/timeweb-certbot.sh cleanup" \
+  --deploy-hook "/root/certbot/certbot/timeweb-certbot.sh deploy" \
   --agree-tos \
   --dry-run \
   --email admin@example.com \
@@ -80,9 +83,9 @@ certbot certonly \
 certbot certonly \
   --manual \
   --preferred-challenges dns \
-  --manual-auth-hook "/root/cerbot/certbot/timeweb-certbot.sh auth" \
-  --manual-cleanup-hook "/root/cerbot/certbot/timeweb-certbot.sh cleanup" \
-  --deploy-hook "/root/cerbot/certbot/timeweb-certbot.sh deploy" \
+  --manual-auth-hook "/root/certbot/certbot/timeweb-certbot.sh auth" \
+  --manual-cleanup-hook "/root/certbot/certbot/timeweb-certbot.sh cleanup" \
+  --deploy-hook "/root/certbot/certbot/timeweb-certbot.sh deploy" \
   --agree-tos \
   --email admin@example.com \
   -d app.example.com \
@@ -123,7 +126,7 @@ certbot renew --dry-run
 Скрипт хранит созданные TXT-записи в файле:
 
 ```bash
-/root/cerbot/certbot/state/records.tsv
+/root/certbot/certbot/state/records.tsv
 ```
 
 Файл нужен cleanup hook'у, чтобы удалить именно те записи, которые создал скрипт.
@@ -133,7 +136,7 @@ certbot renew --dry-run
 Служебные маркеры активных запусков находятся в:
 
 ```bash
-/root/cerbot/certbot/state/runs/
+/root/certbot/certbot/state/runs/
 ```
 
 ## Логи и диагностика
@@ -142,10 +145,14 @@ certbot renew --dry-run
 
 - стандартные логи Certbot в `/var/log/letsencrypt/`;
 - подробный stderr/stdout запуска `timeweb-certbot.sh`;
-- краткий лог скрипта `/root/cerbot/certbot/timeweb-certbot.log`.
+- краткий лог скрипта `/root/certbot/certbot/timeweb-certbot-summary.log`.
+
+Обычные диагностические сообщения скрипт пишет в stderr. Certbot из-за этого может показывать их как `ran with error output`, даже если hook завершился успешно.
+Это не ошибка само по себе: реальную ошибку нужно определять по коду завершения hook'а, строкам с `ERROR` и итоговому сообщению Certbot.
 
 Краткий лог фиксирует успешные выпуски/продления через `deploy-hook` и ошибки самого скрипта.
 Попытки `certbot renew`, при которых сертификат еще не истек и hook'и не запускались, в этот лог не попадают.
+Ошибки Certbot, которые происходят до запуска `manual-auth-hook`, тоже не попадают в этот лог; их нужно смотреть в `/var/log/letsencrypt/`.
 
 Лог автоматически ограничивается размером 1 МБ: перед дописыванием новой записи удаляются самые старые строки.
 Каждая запись занимает одну строку; переносы строк и табы заменяются пробелами, повторяющиеся пробелы сжимаются.
