@@ -33,8 +33,9 @@ STATE_DIR="$SCRIPT_DIR/state"
 STATE_FILE="$STATE_DIR/records.tsv"
 CERTBOT_RUN_STARTED_FILE="$STATE_DIR/certbot-run-started-at"
 
-# RUN_DIR хранит маркеры активных запусков Certbot. Они помогают понять,
-# что второй auth hook в том же запуске не должен чистить запись первого hook'а.
+# RUN_DIR хранит маркеры активных запусков Certbot и список TXT-записей,
+# созданных внутри текущего запуска. Это помогает второму auth hook'у увидеть
+# запись первого hook'а и дождаться сразу обеих DNS-записей.
 RUN_DIR="$STATE_DIR/runs"
 
 # Краткий собственный лог: только успешные deploy и ошибки скрипта.
@@ -44,6 +45,10 @@ TIMEWEB_SUMMARY_LOG_MAX_BYTES=1048576
 
 # Минимальный TTL DNS-записи, который принимает Timeweb API.
 DNS_RECORD_TTL=300
+
+# Наш сценарий всегда выпускает сертификат на пару обычный домен + wildcard.
+# Для Certbot это два DNS-01 challenge и, соответственно, две TXT-записи.
+EXPECTED_DNS_CHALLENGES=2
 
 # Общие параметры curl для запросов к Timeweb API.
 #
@@ -525,32 +530,45 @@ cleanup_state_records_for_subdomain() {
   fi
 }
 
-wait_dns_visible() {
+wait_dns_values_visible() {
   local fqdn="$1"
-  local value="$2"
+  shift
+  local values=("$@")
+
+  ((${#values[@]} > 0)) || fail "Не переданы TXT-значения для ожидания DNS"
 
   # deadline - абсолютное время окончания ожидания. Так проще считать таймаут,
   # чем накапливать количество попыток.
   local start deadline elapsed
   start="$(date +%s)"
   deadline=$(( start + DNS_WAIT_TIMEOUT ))
-  local resolver out ok
+  local resolver out normalized_out ok value missing=()
 
-  log "Жду TXT $fqdn = $value через резолверы: $DNS_RESOLVERS"
+  log "Жду TXT $fqdn через резолверы: $DNS_RESOLVERS. Значений: ${#values[@]}"
 
   while (( $(date +%s) <= deadline )); do
     # ok=1 означает "пока все хорошо". Если хотя бы один резолвер не видит
-    # нужный TXT, ставим ok=0 и ждем следующую попытку.
+    # хотя бы один нужный TXT, ставим ok=0 и ждем следующую попытку.
     ok=1
 
     for resolver in $DNS_RESOLVERS; do
       out="$(dig +time=5 +tries=1 +short @"$resolver" TXT "$fqdn" 2>/dev/null || true)"
+      # dig возвращает TXT в кавычках. Убираем кавычки один раз и дальше
+      # проверяем каждое ожидаемое значение точным сравнением всей строки.
+      normalized_out="$(printf '%s\n' "$out" | tr -d '"')"
+      missing=()
 
-      # dig возвращает TXT в кавычках. tr -d '"' убирает кавычки, а grep -Fqx
-      # ищет точное совпадение всей строки без интерпретации value как regexp.
-      if ! printf '%s\n' "$out" | tr -d '"' | grep -Fqx "$value"; then
+      for value in "${values[@]}"; do
+        # grep -Fqx ищет точное совпадение всей строки без интерпретации value
+        # как regexp. Это важно: validation token может содержать спецсимволы.
+        if ! printf '%s\n' "$normalized_out" | grep -Fqx "$value"; then
+          missing+=("$value")
+        fi
+      done
+
+      if ((${#missing[@]} > 0)); then
         ok=0
-        log "Пока не видно через $resolver. Ответ: ${out:-<empty>}"
+        log "Пока не видно через $resolver. Не хватает TXT: ${missing[*]}. Ответ: ${out:-<empty>}"
         break
       fi
     done
@@ -560,7 +578,7 @@ wait_dns_visible() {
       # проверить чуть позже или через другой путь кешей, поэтому держим
       # дополнительную паузу.
       elapsed=$(( $(date +%s) - start ))
-      log "TXT уже виден через все резолверы через $(format_duration "$elapsed"). Жду еще ${DNS_EXTRA_SLEEP_AFTER_VISIBLE} сек."
+      log "Все TXT уже видны через все резолверы через $(format_duration "$elapsed"). Жду еще ${DNS_EXTRA_SLEEP_AFTER_VISIBLE} сек."
       sleep "$DNS_EXTRA_SLEEP_AFTER_VISIBLE"
       return 0
     fi
@@ -570,7 +588,7 @@ wait_dns_visible() {
     sleep "$DNS_WAIT_INTERVAL"
   done
 
-  fail "TXT $fqdn не появился через все резолверы за ${DNS_WAIT_TIMEOUT} сек."
+  fail "Не все TXT $fqdn появились через все резолверы за ${DNS_WAIT_TIMEOUT} сек."
 }
 
 split_domain_list() {
@@ -666,6 +684,18 @@ run_marker_for_subdomain() {
   printf '%s/%s.active' "$RUN_DIR" "$key"
 }
 
+run_records_file_for_subdomain() {
+  local zone="$1"
+  local subdomain="$2"
+  local marker
+
+  # Для каждого активного запуска рядом с marker-файлом держим отдельный
+  # список TXT-записей этого запуска. Глобальный STATE_FILE нужен cleanup'у,
+  # а этот файл нужен только auth hook'ам, чтобы второй hook знал о первом.
+  marker="$(run_marker_for_subdomain "$zone" "$subdomain")"
+  printf '%s.records.tsv' "${marker%.active}"
+}
+
 marker_pid_is_active() {
   local marker="$1"
   local pid
@@ -683,17 +713,22 @@ prepare_domain_run() {
   local zone="$1"
   local subdomain="$2"
   local token="$3"
-  local marker pid
+  local marker run_records_file pid
 
   # Первый auth hook нового запуска чистит старые записи из state для того же
   # имени _acme-challenge. Второй auth hook того же запуска marker уже увидит
   # и не станет удалять только что созданную запись первого challenge.
   marker="$(run_marker_for_subdomain "$zone" "$subdomain")"
+  run_records_file="$(run_records_file_for_subdomain "$zone" "$subdomain")"
   if marker_pid_is_active "$marker"; then
+    touch "$run_records_file"
+    chmod 600 "$run_records_file" || true
     return 0
   fi
 
   cleanup_state_records_for_subdomain "$zone" "$subdomain" "$token" "stale-before-new-run"
+  : > "$run_records_file"
+  chmod 600 "$run_records_file" || true
 
   # Сохраняем PID certbot и немного диагностической информации. Само наличие
   # marker-файла не важно; важен живой PID внутри него.
@@ -704,17 +739,47 @@ prepare_domain_run() {
   chmod 600 "$marker" || true
 }
 
+save_run_record() {
+  local id="$1"
+  local zone="$2"
+  local subdomain="$3"
+  local value="$4"
+  local run_records_file
+
+  run_records_file="$(run_records_file_for_subdomain "$zone" "$subdomain")"
+  printf '%s\t%s\t%s\t%s\n' "$id" "$zone" "$subdomain" "$value" >> "$run_records_file"
+  chmod 600 "$run_records_file" || true
+}
+
+load_run_values() {
+  local zone_filter="$1"
+  local subdomain_filter="$2"
+  local run_records_file id zone subdomain value
+
+  run_records_file="$(run_records_file_for_subdomain "$zone_filter" "$subdomain_filter")"
+  [[ -f "$run_records_file" ]] || return 0
+
+  while IFS=$'\t' read -r id zone subdomain value; do
+    [[ -n "${id:-}" ]] || continue
+    if [[ "$zone" == "$zone_filter" && "$subdomain" == "$subdomain_filter" ]]; then
+      printf '%s\n' "$value"
+    fi
+  done < "$run_records_file"
+}
+
 cmd_auth() {
   # manual-auth-hook.
   #
   # Certbot вызывает его до проверки домена Let's Encrypt. В этот момент
   # Certbot уже знает validation token и передает его через CERTBOT_VALIDATION.
-  # Задача hook'а: создать TXT-запись и дождаться ее видимости в DNS.
+  # Задача hook'а: создать TXT-запись. В нашем сценарии Certbot вызывает auth
+  # дважды подряд для обычного домена и wildcard. Первый hook только создает
+  # первую TXT-запись, второй создает вторую и ждет появления обеих записей.
   load_env
   require_hook_cmds
 
   local identifier validation domain token zone subdomain fqdn id records_snapshot
-  local elapsed
+  local elapsed pair_started_at run_values=()
 
   # В разных версиях/режимах Certbot имя домена может быть в CERTBOT_IDENTIFIER
   # или CERTBOT_DOMAIN. Берем первый доступный вариант.
@@ -738,14 +803,27 @@ cmd_auth() {
   log "Создаю TXT: zone=$zone, subdomain=$subdomain, fqdn=$fqdn"
   id="$(create_txt_record "$zone" "$subdomain" "$validation" "$token")"
   save_state "$id" "$zone" "$subdomain" "$validation"
+  save_run_record "$id" "$zone" "$subdomain" "$validation"
   log "Создана TXT-запись id=$id"
   records_snapshot="$(summarize_txt_records "$zone" "$subdomain" "$token")"
   log "TXT-записи Timeweb для zone=$zone, subdomain=$subdomain: $records_snapshot"
   event_log "INFO" "Создана TXT-запись: id=$id zone=$zone subdomain=$subdomain fqdn=$fqdn value=$validation ttl=${DNS_RECORD_TTL}s; current_txt=$records_snapshot"
 
-  wait_dns_visible "$fqdn" "$validation"
-  elapsed="$(elapsed_since "$RUN_STARTED_AT")"
-  log "Auth hook завершен за $(format_duration "$elapsed")"
+  mapfile -t run_values < <(load_run_values "$zone" "$subdomain")
+  if ((${#run_values[@]} < EXPECTED_DNS_CHALLENGES)); then
+    log "Создано TXT-записей текущего запуска: ${#run_values[@]}/${EXPECTED_DNS_CHALLENGES}. DNS-ожидание начнется после второй записи."
+    return 0
+  fi
+
+  if ((${#run_values[@]} > EXPECTED_DNS_CHALLENGES)); then
+    log "В текущем запуске найдено TXT-записей больше ожидаемого: ${#run_values[@]}/${EXPECTED_DNS_CHALLENGES}. Буду ждать все найденные значения."
+  fi
+
+  wait_dns_values_visible "$fqdn" "${run_values[@]}"
+  pair_started_at="$(certbot_elapsed_start)"
+  elapsed="$(elapsed_since "$pair_started_at")"
+  log "DNS-подготовка для двух доменов завершена за $(format_duration "$elapsed"): создано ${#run_values[@]}/${EXPECTED_DNS_CHALLENGES} TXT, DNS виден, дополнительная пауза выдержана."
+  event_log "INFO" "DNS-подготовка для двух доменов завершена: fqdn=$fqdn records=${#run_values[@]}/${EXPECTED_DNS_CHALLENGES} duration=${elapsed}s"
 }
 
 cmd_cleanup() {
