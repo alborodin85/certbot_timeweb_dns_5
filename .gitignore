@@ -3,4 +3,6 @@ http-client.env.json
 timeweb.env
 state/
 certbot/state/
+certbot/timeweb-certbot.log
 TODO.md
+requests
