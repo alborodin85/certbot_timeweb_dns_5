@@ -559,8 +559,8 @@ validate_certbot_domain_pair() {
   # потому что именно там Certbot передает CERTBOT_ALL_DOMAINS.
   #
   # Важно: для wildcard-имени Certbot передает в hook уже нормализованный
-  # домен без "*.". Поэтому команда с `-d it5.su -d '*.it5.su'` в hook может
-  # выглядеть как `it5.su it5.su`. Это нормально.
+  # домен без "*.". Поэтому команда с `-d example.com -d '*.example.com'`
+  # в hook может выглядеть как `example.com example.com`. Это нормально.
   [[ -n "${CERTBOT_ALL_DOMAINS:-}" ]] || fail "Certbot не передал CERTBOT_ALL_DOMAINS; невозможно проверить пару обычный домен + wildcard"
 
   local domains=()

@@ -46,7 +46,7 @@ Wildcard нужно брать в кавычки. Без кавычек shell м
 ```bash
 apt update
 apt install -y certbot curl jq dnsutils procps
-git clone git@github.com:alborodin85/certbot_timeweb_dns_5.git /root/certbot
+git clone https://github.com/alborodin85/certbot_timeweb_dns_5.git /root/certbot
 cd /root/certbot
 cp certbot/timeweb.env.example certbot/timeweb.env
 chmod 600 certbot/timeweb.env
